@@ -25,6 +25,7 @@ from collections import OrderedDict, namedtuple
 import sqlite3
 import logging
 import fnmatch
+import pathlib
 
 import numpy as np  # type: ignore
 
@@ -32,8 +33,8 @@ from sasmodels import core as sascore
 from sasmodels import compare as sascomp
 from sasmodels import data as sasdata
 
-from . import sas_io
-from .util.utils import columnize
+from sasnets import sas_io
+from sasnets.util.utils import columnize
 
 MODELS = sascore.list_models()
 
@@ -72,8 +73,8 @@ parser.add_argument(
     "--count", type=int, default=1000,
     help="Count is the number of distinct models to generate.")
 parser.add_argument(
-    "--template", type=str, default="",
-    help="SANS dataset defining q and resolution.")
+    "--templates", nargs='*',
+    help="List SANS dataset(s) defining q and resolution.")
 parser.add_argument(
     "--resolution", type=float, default=3,
     help="Constant dQ/Q resolution percentage.")
@@ -106,13 +107,22 @@ parser.add_argument(
     model requires double.""")
 parser.add_argument(
     "-v", "--verbose",
-    help="Verbose output level.", choices=[0, 1, 2])
+    help="Verbose output level.", choices=['0', '1', '2'])
+parser.add_argument(
+    "--background",type=float,
+    help="Constant incoherent background level", default=1e-5)
+parser.add_argument(
+    "--random_background", action='store_true',
+    help="Log-uniform random incoherent background")
+parser.add_argument(
+    "--random_background_range", nargs=2, type=float, default=(-5,2),
+    help="Log-uniform incoherent background range as powers of 10 (i.e. 10^-5 -- 10^2)")
 
 
 # noinspection PyTypeChecker
-def gen_data(model_name, data, count=1, noise=2,
+def gen_data(model_name, model_domains, count=1, noise=2,
              mono=True, magnetic=False, cutoff=1e-5,
-             maxdim=np.inf, precision='double'):
+             maxdim=np.inf, precision='double',bg=None):
     r"""
     Generates the data for the given model and parameters.
 
@@ -133,16 +143,21 @@ def gen_data(model_name, data, count=1, noise=2,
     *{par: value, ...}* and *data* is *(q, dq, iq, diq)*.
     """
     is2d = False
-    assert data.x.size > 0
     model_info = sascore.load_model_info(model_name)
-    calculator = sascomp.make_engine(model_info, data, precision, cutoff)
     default_pars = sascomp.get_pars(model_info)
-    assert calculator._data.x.size > 0
-    x, dx = calculator._data.x, calculator._data.dx
+    calculators = []
+    for name,data,index in model_domains:
+        assert data.x.size > 0
+        calculator = sascomp.make_engine(model_info, data, precision, cutoff)
+        assert calculator._data.x.size > 0
+        # x, dx = calculator._data.x, calculator._data.dx
+        calculators.append([name,calculator])
+
+    background, random_background, random_background_range = bg
 
     # A not very clean macro for evaluating the models, wich uses name and
     # seed from the current scope even though they haven't been defined yet.
-    def simulate(pars):
+    def simulate(calculator,pars):
         """
         Generate a random dataset for *fn* evaluated at *pars*.
         Returns *(x, dx, y, dy)*, o.
@@ -150,6 +165,7 @@ def gen_data(model_name, data, count=1, noise=2,
         Note that this replaces the data object within *fn*.
         """
         # TODO: support 2D data, which does not use x, dx, y, dy
+        x, dx = calculator._data.x, calculator._data.dx
         try:
             assert calculator._data.x.size > 0
             calculator.simulate_data(noise=noise, **pars)
@@ -173,6 +189,10 @@ def gen_data(model_name, data, count=1, noise=2,
         parlist = parlist.replace(': ', '=')
         return parlist
 
+    def loguniform(low=0, high=1, size=None, base=10):
+        ''' https://stackoverflow.com/a/43977980 '''
+        return np.power(base, np.random.uniform(low, high, size))
+
     t0 = -np.inf
     interval = 5
     for k in range(count):
@@ -190,22 +210,28 @@ def gen_data(model_name, data, count=1, noise=2,
             pars = sascomp.suppress_pd(pars)
         if not magnetic:
             pars = sascomp.suppress_magnetism(pars)
-        pars.update({'scale': 1, 'background': 1e-5})
+
+        if random_background:
+            background = loguniform(*random_background_range,size=1)[0] #originally fixed at 1e-5
+
+        pars.update({'scale': 1, 'background': background})
         #print(f"{model_name} {seed} {pretty(pars)}")
 
         # Evaluate model
-        data = simulate(pars) # q, dq, iq, diq
 
-        # Skip data sets with NaN or negative numbers.
-        # Note: some datasets will have fewer entries than others.
-        if np.isnan(data[2]).any():
-            print(f">>> NaN in {model_name} {seed} {pretty(pars)}")
-            continue
-        if (data[2] <= 0.).any():
-            print(f">>> Negative values in {model_name} {seed} {pretty(pars)}")
-            continue
+        for name,calculator in calculators:
+            data = simulate(calculator,pars) # q, dq, iq, diq
 
-        yield seed, pars, data
+            # Skip data sets with NaN or negative numbers.
+            # Note: some datasets will have fewer entries than others.
+            if np.isnan(data[2]).any():
+                print(f">>> NaN in {model_name} {seed} {pretty(pars)}")
+                continue
+            if (data[2] <= 0.).any():
+                print(f">>> Negative values in {model_name} {seed} {pretty(pars)}")
+                continue
+
+            yield name,(seed,pars,data)
 
     # TODO: can free the calculator now
     print(f"Complete {model_name}")
@@ -252,6 +278,7 @@ def run_model(opts):
     precision = opts.precision
     res = opts.resolution
     noise = opts.noise
+    bg = (opts.background,opts.random_background,opts.random_background_range) 
 
     # Figure out which models we are using.
     include = model_group(opts.models, required=True)
@@ -259,49 +286,58 @@ def run_model(opts):
     model_list = sorted(set(include)-set(exclude))
     print("Selected models:\n", columnize(model_list, indent="  "))
 
-    if opts.template:
+    model_domains = []
+    if opts.templates:
         # Fetch q, dq from an actual SANS file
-        data, index = sasdata.read(opts.template), None
+        for template in opts.templates:
+            name = pathlib.Path(template).with_suffix('').parts[-1]
+            data,index = sasdata.load_data(template), None
+            model_domains.append([name,data,index])
     else:
         # Generate
         data, index = sascomp.make_data({
             'qmin': 1e-4, 'qmax': 0.2, 'is2d': is2D, 'nq': nq, 'res': res/100,
             'accuracy': 'Low', 'view': 'log', 'zero': False,
-            })
+        })
+        model_domains.append(["default",data,index])
 
     # Open database and lookup model counts.
     db = sas_io.sql_connect(opts.database)
-    model_counts = sas_io.model_counts(db, tag)
-    #print(model_counts)
+
     for model in model_list:
-        # Figure out how many more entries we need for the model
-        missing = count - model_counts.get(model, 0)
-        if missing <= 0:
-            continue
+        missing = []
+        for name,data,index in model_domains:
+            model_counts = sas_io.model_counts(db, name+'_'+tag)
+            missing.append(count - model_counts.get(model, 0))
+        missing = max(missing)
+        #if missing <= 0:
+        #    continue
         # TODO: should not need deepcopy(data) but something is messing with q
         seq = gen_data(
-            model, deepcopy(data), count=missing, mono=mono, magnetic=magnetic,
-            cutoff=cutoff, precision=precision, noise=noise)
+            model, deepcopy(model_domains), count=missing, mono=mono, magnetic=magnetic,
+            cutoff=cutoff, precision=precision, noise=noise,bg=bg)
         # Process the missing entries batch by batch so if there is an
         # error we won't lose the entire group.
-        for batch in chunk(seq, batch_size=100):
-            sas_io.write_sql(db, model, batch, tag=tag)
-            #sas_io.write_1d(path, model, items, tag=tag)
+        for batch_dict in chunk(seq, batch_size=100):
+            for name,batch in batch_dict.items():
+                sas_io.write_sql(db, model, batch, tag=name+'_'+tag)
+        #sas_io.write_1d(path, model, items, tag=tag)
     #sas_io.read_sql(db, tag)
     db.close()
 
+from collections import defaultdict
 def chunk(seq, batch_size):
     """
     Generic iter tool: chunk sequence in groups of *batch_size*.
 
     Remaining items are returned in final group.
     """
-    batch = []
-    for item in seq:
-        if len(batch) == batch_size:
+    batch = defaultdict(list)
+    for name,item in seq:
+        if any([len(k) == batch_size for k,v in batch.items()]):
             yield batch
-            batch = []
-        batch.append(item)
+            batch = defaultdict(list)
+        batch[name].append(item)
     yield batch
 
 def main():
